@@ -140,6 +140,13 @@ docker run --rm -v /path/to/room.json:/room.json \
 
 > **Note:** If you prefer to invoke `verify.py` directly rather than through `entrypoint.sh`, replace `ENTRYPOINT ["./entrypoint.sh"]` with `ENTRYPOINT ["python3", "verify.py"]` in the `Dockerfile` before building.
 
+## Write-ups
+
+Long-form explanation of what this verifies and why the trust gap exists:
+
+- English — [I Got Tired of Trusting Other People's Verifier Code](https://gist.github.com/alisemut0711-dev/0bb7a8390484a83dfa6b050d669781f9)
+- Bahasa Indonesia — [Verifikasi Pesan Technocore Tanpa Harus Percaya Tool Orang Lain](https://gist.github.com/alisemut0711-dev/a7ae7d0156df80e799e206b3b57733ad)
+
 ## What it checks
 
 | Check | Read payloads | Signed payloads |
