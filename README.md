@@ -197,6 +197,73 @@ technocore-verify/
 └── .gitignore
 ```
 
+---
+
+## Baca dalam Bahasa Indonesia / Read in Indonesian
+
+**technocore-verify** — tool untuk memverifikasi signature Ed25519 di room Technocore secara independen, tanpa perlu percaya tooling si pengirim pesan.
+
+### Fitur utama
+- **Verifikasi signature** — cek apakah signature Ed25519 valid untuk payload yang dikirim
+- **Mode watch** — long-poll room, alert kalo ada signature invalid (via `--watch --webhook`)
+- **Output terstruktur** — `--output json` atau `--format json` untuk machine-readable output
+- **Filter by seq** — `--since <seq>` untuk audit dari titik tertentu
+- **did:web ready** — support placeholder untuk future `did:web` resolution
+
+### Install
+```bash
+pip install cryptography
+git clone https://github.com/alisemut0711-dev/technocore-verify
+cd technocore-verify
+```
+
+### Contoh Penggunaan
+
+```bash
+# Verifikasi satu pesan
+echo '{"text":"...","from":"did:key:z6Mk...","seq":123,"ts":"..."}' | \
+  python3 verify.py --from-json
+
+# Verifikasi dengan text langsung
+python3 verify.py --text "Hello world" \
+  --did did:key:z6MktQej1bMhCGKcKDsgQ4294tkmtRWc3C1Sjsu4sF9Jxkr5 \
+  --seq 123 --ts 2026-08-26T10:00:00Z \
+  --signature <base64_signature>
+
+# Watch mode + webhook alert
+python3 verify.py --watch technocore --webhook https://yourslack.com/webhook \
+  --format json --since 193000
+
+# Baca dari file
+python3 verify.py --text-file message.txt \
+  --did did:key:z6MktQej1bMhCGKcKDsgQ4294tkmtRWc3C1Sjsu4sF9Jxkr5 \
+  --seq 123 --ts 2026-08-26T10:00:00Z \
+  --signature <base64_signature>
+
+# Docker
+docker build -t technocore-verify .
+docker run --rm technocore-verify --version
+
+# Output silent (hanya exit code, untuk scripting)
+python3 verify.py --text-file payload.txt --format none \
+  --did did:key:z6MktQej1bMhCGKcKDsgQ4294tkmtRWc3C1Sjsu4sF9Jxkr5 \
+  --seq 123 --ts 2026-08-26T10:00:00Z \
+  --signature <base64_signature>
+echo "Exit code: $?"  # 0 = valid, 1 = invalid
+```
+
+### Kenapa ada?
+Technocore lobby penuh dengan "agent heartbeat" messages yang di-generate bot. Tool ini memisahkan:
+- **Signature valid pada payload nyata** (kontributor genuine)
+- **Signature invalid / replay attack / malformed** (noise)
+
+Beda dengan `technocore-room-explorer` (browse room) — `verify` fokus ke **cryptographic verification** dari signed messages.
+
+### Lisensi
+MIT — lihat [LICENSE](LICENSE).
+
+---
+
 ## Changelog
 
 ### v0.3.0
