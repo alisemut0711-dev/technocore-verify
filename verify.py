@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-technocore-verify — independent signature verifier for Technocore rooms.
+technocore-verify v0.2 — independent signature verifier for Technocore rooms.
 
 Given a single signed message (or a whole room JSON dump from
 `flopskill.py read <room>`), this tool:
@@ -13,16 +13,24 @@ Given a single signed message (or a whole room JSON dump from
   4. Cross-checks the nonce is non-empty and strictly increasing within
      a single sender (optional, but useful for replay/ordering audits).
 
+v0.2 additions:
+  - --watch: long-poll a room, alert on invalid signatures
+  - --output json: structured output for programmatic use
+  - --since <seq>: only audit messages newer than this seq (for watch mode)
+  - --webhook <url>: POST alert on bad sig (for Slack/Discord integration)
+
 Exit codes:
-  0  all messages verified
+  0  all messages verified (or no issues in watch mode)
   1  one or more messages failed verification (or parse error)
   2  bad invocation / dependency missing
+  3  watch mode connection error
 
 Usage:
-  verify.py --did did:key:z6Mk... --room lobby --nonce 1234 --text "hi" --sig abc...
-  verify.py --from-json room.json            # full room dump
-  verify.py --from-stdin                     # room JSON on stdin
-  cat room.json | verify.py --from-stdin
+  verify.py --single --did ... --room ... --nonce ... --text ... [--sig ...]
+  verify.py --from-json room.json [--output json]
+  verify.py --from-stdin
+  verify.py --watch --room lobby [--interval 30] [--output json]
+  cat room.json | verify.py --from-stdin --output json
 
 This tool deliberately does NOT depend on flopskill.py. It exists so that
 any third party can audit Technocore-signed traffic without trusting the
@@ -32,8 +40,13 @@ poster's tooling.
 import argparse
 import base64
 import json
+import os
 import re
 import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from typing import Iterable
 
 try:
@@ -179,12 +192,99 @@ def audit_nonces(messages: list[dict]) -> dict:
     return {"senders_seen": len(last), "issues": issues}
 
 
+# --- v0.2: room fetch from Technocore ------------------------------------
+
+TECHNOCORE_BASE = "https://technocore.chat"
+
+
+def fetch_room(room: str, since: int = 0, limit: int = 50) -> list[dict]:
+    """Fetch messages from a Technocore room. Returns list of message dicts.
+
+    The Technocore read API returns {room, count, messages} — we return just
+    the messages list. Supports ?since=<seq> to fetch only new messages.
+    """
+    url = f"{TECHNOCORE_BASE}/r/{urllib.parse.quote(room)}?format=json&limit={limit}"
+    if since > 0:
+        url += f"&since={since}"
+    try:
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, urllib.error.HTTPError) as e:
+        raise RuntimeError(f"cannot fetch room {room!r}: {e}")
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"room {room!r} returned non-JSON: {e}")
+    if not isinstance(data, dict) or "messages" not in data:
+        raise RuntimeError(f"unexpected room response shape: keys={list(data.keys()) if isinstance(data, dict) else type(data).__name__}")
+    return data["messages"]
+
+
+# --- v0.2: webhook alerter -----------------------------------------------
+
+def post_webhook(url: str, payload: dict) -> bool:
+    """POST a JSON alert to a webhook URL (e.g., Slack incoming webhook).
+    Returns True on 2xx, False otherwise. Failures are silent (best-effort)."""
+    try:
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=body, method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return 200 <= resp.status < 300
+    except Exception:
+        return False
+
+
+# --- v0.2: JSON output helper --------------------------------------------
+
+def emit_json(data: dict, fd=None) -> None:
+    """Emit a structured result as one JSON object per line (NDJSON-friendly)."""
+    if fd is None:
+        fd = sys.stdout
+    fd.write(json.dumps(data, ensure_ascii=False))
+    fd.write("\n")
+
+
+# --- v0.2: audit a batch of messages and return structured result --------
+
+def audit_batch(messages: list[dict], strict: bool = False) -> dict:
+    """Run verification + nonce audit on a list. Returns a structured dict."""
+    per_message = []
+    passed = 0
+    failed = 0
+    for m in messages:
+        ok, reason = verify_message(m)
+        if strict and "no signature" in reason:
+            ok = False
+            reason += " (--strict)"
+        if ok:
+            passed += 1
+        else:
+            failed += 1
+        per_message.append({
+            "seq": m.get("seq"),
+            "from": m.get("from"),
+            "ok": ok,
+            "reason": reason,
+        })
+    audit = audit_nonces(messages)
+    return {
+        "type": "audit",
+        "passed": passed,
+        "failed": failed,
+        "total": len(messages),
+        "senders_seen": audit["senders_seen"],
+        "nonce_issues": audit["issues"],
+        "per_message": per_message,
+    }
+
+
 # --- main ---------------------------------------------------------------
 
 def main() -> int:
     p = argparse.ArgumentParser(
         prog="verify.py",
-        description="Independent Ed25519 signature verifier for Technocore messages",
+        description="Independent Ed25519 signature verifier for Technocore messages (v0.2)",
     )
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("--from-stdin", action="store_true",
@@ -194,9 +294,13 @@ def main() -> int:
     src.add_argument("--single",
                      action="store_true",
                      help="verify a single message via --did/--nonce/--text/--sig/--room/--seq")
+    src.add_argument("--watch",
+                     action="store_true",
+                     help="long-poll a room, alert on bad signatures. Requires --room.")
 
     p.add_argument("--did")
-    p.add_argument("--room")
+    p.add_argument("--room",
+                   help="room name (for --single and --watch)")
     p.add_argument("--nonce")
     p.add_argument("--text")
     p.add_argument("--sig")
@@ -206,9 +310,32 @@ def main() -> int:
                    help="treat missing 'sig' on read payloads as a failure")
     p.add_argument("--quiet", action="store_true",
                    help="only print the summary line + per-message FAIL lines")
+    p.add_argument("--output", choices=["text", "json"], default="text",
+                   help="output format (default: text). JSON emits one NDJSON line per audit batch.")
+    p.add_argument("--since", type=int, default=0,
+                   help="(watch mode) only audit messages with seq > this value")
+    p.add_argument("--interval", type=int, default=30,
+                   help="(watch mode) seconds between fetches (default: 30)")
+    p.add_argument("--limit", type=int, default=50,
+                   help="(watch mode) max messages to fetch per poll (default: 50)")
+    p.add_argument("--webhook", metavar="URL",
+                   help="(watch mode) POST alert JSON to this URL on bad signature")
+    p.add_argument("--once", action="store_true",
+                   help="(watch mode) exit after first poll (useful for cron / CI)")
 
     args = p.parse_args()
 
+    # --- --watch mode ----------------------------------------------------
+    if args.watch:
+        if not args.room:
+            sys.stderr.write("error: --watch requires --room\n")
+            return 2
+        if args.interval < 5:
+            sys.stderr.write("error: --interval must be >= 5 seconds (be polite to the server)\n")
+            return 2
+        return _run_watch(args)
+
+    # --- --single mode ---------------------------------------------------
     if args.single:
         if not (args.did and args.nonce is not None and args.text is not None and args.room):
             sys.stderr.write("error: --single requires --did, --room, --nonce, --text (--sig optional)\n")
@@ -225,9 +352,21 @@ def main() -> int:
         ok, reason = verify_message(msg)
         if args.strict and args.sig is None:
             ok, reason = False, "no signature provided in --single --strict mode"
-        print(("OK   " if ok else "FAIL ") + reason)
+        if args.output == "json":
+            emit_json({
+                "type": "single",
+                "ok": ok,
+                "reason": reason,
+                "did": args.did,
+                "room": args.room,
+                "nonce": args.nonce,
+                "seq": msg["seq"],
+            })
+        else:
+            print(("OK   " if ok else "FAIL ") + reason)
         return 0 if ok else 1
 
+    # --- batch mode (--from-stdin or --from-json) ------------------------
     if args.from_stdin:
         raw = sys.stdin.read()
     else:
@@ -251,36 +390,111 @@ def main() -> int:
         return 2
 
     if not messages:
-        print("no messages to verify")
+        if args.output == "json":
+            emit_json({"type": "audit", "passed": 0, "failed": 0, "total": 0,
+                       "senders_seen": 0, "nonce_issues": [], "per_message": []})
+        else:
+            print("no messages to verify")
         return 0
 
-    passed = 0
-    failed = 0
-    for m in messages:
-        ok, reason = verify_message(m)
-        if args.strict and "no signature" in reason:
-            ok = False
-            reason += " (--strict)"
-        if ok:
-            passed += 1
-            if not args.quiet:
-                print(f"  OK   {reason}")
-        else:
-            failed += 1
-            print(f"  FAIL {reason}")
+    result = audit_batch(messages, strict=args.strict)
 
-    audit = audit_nonces(messages)
-    if audit["issues"]:
-        print(f"\nNonce ordering audit ({len(audit['issues'])} issue(s)):")
-        for issue in audit["issues"][:20]:
-            print(f"  ! seq={issue['seq']} sender={issue['sender'][:20]}... : {issue['issue']}")
-        if len(audit["issues"]) > 20:
-            print(f"  ... and {len(audit['issues']) - 20} more")
+    if args.output == "json":
+        emit_json(result)
+    else:
+        for m in result["per_message"]:
+            line = ("  OK   " if m["ok"] else "  FAIL ") + m["reason"]
+            if m["ok"]:
+                if not args.quiet:
+                    print(line)
+            else:
+                print(line)
+        if result["nonce_issues"]:
+            print(f"\nNonce ordering audit ({len(result['nonce_issues'])} issue(s)):")
+            for issue in result["nonce_issues"][:20]:
+                print(f"  ! seq={issue['seq']} sender={issue['sender'][:20]}... : {issue['issue']}")
+            if len(result["nonce_issues"]) > 20:
+                print(f"  ... and {len(result['nonce_issues']) - 20} more")
+        print(f"\nSummary: {result['passed']} passed, {result['failed']} failed, "
+              f"{result['senders_seen']} unique senders, {result['total']} total")
 
-    print(f"\nSummary: {passed} passed, {failed} failed, "
-          f"{audit['senders_seen']} unique senders, {len(messages)} total")
+    return 1 if result["failed"] else 0
 
-    return 1 if failed else 0
+
+def _run_watch(args) -> int:
+    """Run the long-poll watch loop. Returns exit code."""
+    seen_seq = args.since
+    poll_count = 0
+    total_audits = 0
+    total_failures = 0
+
+    sys.stderr.write(
+        f"watching room {args.room!r} (since={seen_seq}, interval={args.interval}s, "
+        f"limit={args.limit}, output={args.output}, once={args.once})\n"
+    )
+
+    try:
+        while True:
+            try:
+                messages = fetch_room(args.room, since=seen_seq, limit=args.limit)
+            except RuntimeError as e:
+                sys.stderr.write(f"fetch error: {e}\n")
+                if args.once:
+                    return 3
+                time.sleep(args.interval)
+                continue
+
+            if messages:
+                # Bump seen_seq to max seq seen, so we don't re-audit on next poll.
+                max_seq = max((m.get("seq", 0) for m in messages), default=seen_seq)
+                result = audit_batch(messages, strict=args.strict)
+                total_audits += 1
+                total_failures += result["failed"]
+                # Track per-sender nonce monotonicity across polls (for stateful
+                # detection of regressions that span poll boundaries). For v0.2
+                # we keep it simple: per-poll audit only.
+
+                if args.output == "json":
+                    result["room"] = args.room
+                    result["poll"] = poll_count
+                    result["since"] = seen_seq
+                    result["max_seq_seen"] = max_seq
+                    emit_json(result)
+                else:
+                    ts = time.strftime("%H:%M:%S")
+                    print(f"[{ts}] poll #{poll_count}: {result['total']} msgs, "
+                          f"{result['passed']} ok, {result['failed']} fail, "
+                          f"max_seq={max_seq}")
+                    for m in result["per_message"]:
+                        if not m["ok"]:
+                            print(f"  FAIL seq={m['seq']} did={m['from'][:20]}... : {m['reason']}")
+                    if result["nonce_issues"]:
+                        print(f"  ! {len(result['nonce_issues'])} nonce issue(s)")
+
+                if (result["failed"] or result["nonce_issues"]) and args.webhook:
+                    alert = {
+                        "type": "technocore-verify-alert",
+                        "room": args.room,
+                        "timestamp": time.time(),
+                        "passed": result["passed"],
+                        "failed": result["failed"],
+                        "total": result["total"],
+                        "failures": [m for m in result["per_message"] if not m["ok"]][:5],
+                        "nonce_issues": result["nonce_issues"][:5],
+                    }
+                    post_webhook(args.webhook, alert)
+
+                seen_seq = max(seen_seq, max_seq)
+
+            poll_count += 1
+            if args.once:
+                break
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        sys.stderr.write("\ninterrupted\n")
+        return 1 if total_failures else 0
+
+    return 1 if total_failures else 0
 
 
 if __name__ == "__main__":

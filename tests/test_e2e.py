@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end tests for verify.py.
+"""End-to-end tests for verify.py v0.2.
 
 Run from this directory:
   python3 -m tests.test_e2e
@@ -198,6 +198,122 @@ class TestNonceAudit(unittest.TestCase):
         out = r.stdout.decode()
         self.assertIn("regression", out)
         self.assertIn("duplicate", out)
+
+
+# === v0.2: new tests for --output json and --watch ===
+
+class TestJSONOutput(unittest.TestCase):
+    def test_single_json_output(self):
+        r = run([
+            "--single", "--output", "json",
+            "--did", "did:key:z6MktQej1bMhCGKcKDsgQ4294tkmtRWc3C1Sjsu4sF9Jxkr5",
+            "--room", "lobby", "--nonce", "42", "--text", "hi",
+        ], expect=0)
+        line = r.stdout.decode().strip()
+        data = json.loads(line)
+        self.assertEqual(data["type"], "single")
+        self.assertTrue(data["ok"])
+        self.assertIn("reason", data)
+        self.assertEqual(data["room"], "lobby")
+
+    def test_batch_json_output(self):
+        msgs = {
+            "messages": [
+                {"seq": 1, "from": "did:key:z6MktQej1bMhCGKcKDsgQ4294tkmtRWc3C1Sjsu4sF9Jxkr5",
+                 "nonce": 10, "text": "x"},
+                {"seq": 2, "from": "did:key:z6MktQej1bMhCGKcKDsgQ4294tkmtRWc3C1Sjsu4sF9Jxkr5",
+                 "nonce": 5, "text": "y"},  # regression
+            ]
+        }
+        r = run(["--from-stdin", "--output", "json"],
+                input_bytes=json.dumps(msgs).encode(), expect=0)
+        line = r.stdout.decode().strip()
+        data = json.loads(line)
+        self.assertEqual(data["type"], "audit")
+        self.assertEqual(data["passed"], 2)
+        self.assertEqual(data["failed"], 0)
+        self.assertEqual(data["total"], 2)
+        self.assertEqual(len(data["nonce_issues"]), 1)
+        self.assertIn("regression", data["nonce_issues"][0]["issue"])
+
+    def test_empty_room_json(self):
+        r = run(["--from-stdin", "--output", "json"],
+                input_bytes=b'{"messages":[]}', expect=0)
+        data = json.loads(r.stdout.decode().strip())
+        self.assertEqual(data["total"], 0)
+        self.assertEqual(data["passed"], 0)
+
+
+class TestWatchMode(unittest.TestCase):
+    def test_watch_requires_room(self):
+        r = run(["--watch"], expect=2)
+        self.assertIn("--room", r.stderr.decode())
+
+    def test_watch_interval_minimum(self):
+        r = run(["--watch", "--room", "lobby", "--interval", "1"], expect=2)
+        self.assertIn("interval", r.stderr.decode().lower())
+
+    def test_watch_once_real_room(self):
+        """One-shot poll of real room. Should emit JSON and not hang."""
+        r = run([
+            "--watch", "--room", "lobby", "--once", "--output", "json",
+            "--limit", "10",
+        ], expect=0, timeout=60)
+        # Empty rooms or no new messages => still valid JSON
+        out = r.stdout.decode().strip()
+        # If the room returned messages, first line is JSON. If empty, no output.
+        if out:
+            data = json.loads(out.split("\n")[0])
+            self.assertEqual(data["type"], "audit")
+            self.assertIn("passed", data)
+
+
+class TestWebhook(unittest.TestCase):
+    def test_post_webhook_to_local_server(self):
+        """Spin up a tiny HTTP server, post to it, verify it received the alert."""
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        from threading import Thread
+        import time
+
+        from verify import post_webhook
+
+        received = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length)
+                received.append(json.loads(body))
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *a, **k):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        port = server.server_address[1]
+        t = Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        try:
+            ok = post_webhook(f"http://127.0.0.1:{port}/alert", {"type": "test", "x": 1})
+            self.assertTrue(ok)
+            time.sleep(0.1)
+            self.assertEqual(len(received), 1)
+            self.assertEqual(received[0]["type"], "test")
+        finally:
+            server.shutdown()
+
+
+class TestFetchRoom(unittest.TestCase):
+    def test_fetch_real_room_lobby(self):
+        """Fetch the real Technocore lobby. Should return a list (may be empty)."""
+        from verify import fetch_room
+        try:
+            msgs = fetch_room("lobby", since=0, limit=5)
+            self.assertIsInstance(msgs, list)
+        except RuntimeError as e:
+            # If the network is unreachable from CI, skip rather than fail.
+            self.skipTest(f"cannot reach Technocore: {e}")
 
 
 if __name__ == "__main__":
