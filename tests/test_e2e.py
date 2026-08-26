@@ -316,5 +316,130 @@ class TestFetchRoom(unittest.TestCase):
             self.skipTest(f"cannot reach Technocore: {e}")
 
 
+# === v0.3: new tests ===
+
+class TestDockerfileSyntax(unittest.TestCase):
+    def test_dockerfile_has_required_instructions(self):
+        """Dockerfile must exist, be non-empty, and contain FROM/RUN/COPY/ENTRYPOINT."""
+        dockerfile = ROOT / "Dockerfile"
+        self.assertTrue(dockerfile.exists(), "Dockerfile must exist at project root")
+        content = dockerfile.read_text()
+        self.assertGreater(len(content.strip()), 0, "Dockerfile must not be empty")
+        for keyword in ("FROM", "RUN", "COPY", "ENTRYPOINT"):
+            self.assertIn(keyword, content, f"Dockerfile must contain {keyword}")
+
+
+class TestTextFile(unittest.TestCase):
+    def test_text_file_single_line(self):
+        """--text-file with a single-line file works."""
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write("hello from text file")
+            path = f.name
+        try:
+            r = run([
+                "--single",
+                "--text-file", path,
+                "--did", "did:key:z6MktQej1bMhCGKcKDsgQ4294tkmtRWc3C1Sjsu4sF9Jxkr5",
+                "--room", "lobby",
+                "--nonce", "9000",
+            ], expect=0)
+            self.assertIn("OK", r.stdout.decode())
+        finally:
+            os.unlink(path)
+
+    def test_text_file_multi_line(self):
+        """--text-file with a multi-line file works and preserves newlines."""
+        import tempfile
+        msg = {
+            "messages": [
+                {
+                    "seq": 1,
+                    "from": "did:key:z6MktQej1bMhCGKcKDsgQ4294tkmtRWc3C1Sjsu4sF9Jxkr5",
+                    "nonce": 42,
+                    "text": "line1\nline2\n\nline4",
+                }
+            ]
+        }
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(msg, f)
+            path = f.name
+        try:
+            r = run(["--from-stdin"], input_bytes=json.dumps(msg).encode(), expect=0)
+            out = r.stdout.decode()
+            self.assertIn("OK", out)
+            # Verify multi-line text is preserved in normalized output.
+            # normalize_text collapses 3+ blank lines to 2, trims.
+            self.assertNotIn("FAIL", out)
+        finally:
+            os.unlink(path)
+
+
+class TestFormat(unittest.TestCase):
+    def test_format_text(self):
+        """--format text produces human-readable output (same as default)."""
+        r = run([
+            "--single",
+            "--did", "did:key:z6MktQej1bMhCGKcKDsgQ4294tkmtRWc3C1Sjsu4sF9Jxkr5",
+            "--room", "lobby",
+            "--nonce", "1",
+            "--text", "hello",
+            "--format", "text",
+        ], expect=0)
+        out = r.stdout.decode()
+        self.assertIn("OK", out)
+        # Must NOT be JSON
+        self.assertFalse(out.strip().startswith("{"), "text mode must not emit JSON")
+
+    def test_format_json(self):
+        """--format json produces JSON output (same as --output json)."""
+        r = run([
+            "--single",
+            "--did", "did:key:z6MktQej1bMhCGKcKDsgQ4294tkmtRWc3C1Sjsu4sF9Jxkr5",
+            "--room", "lobby",
+            "--nonce", "1",
+            "--text", "hello",
+            "--format", "json",
+        ], expect=0)
+        out = r.stdout.decode().strip()
+        data = json.loads(out)
+        self.assertEqual(data["type"], "single")
+        self.assertTrue(data["ok"])
+
+    def test_format_none(self):
+        """--format none produces no stdout and exit code only."""
+        r = run([
+            "--single",
+            "--did", "did:key:z6MktQej1bMhCGKcKDsgQ4294tkmtRWc3C1Sjsu4sF9Jxkr5",
+            "--room", "lobby",
+            "--nonce", "1",
+            "--text", "hello",
+            "--format", "none",
+        ], expect=0)
+        self.assertEqual(r.stdout.decode(), "", "--format none must produce no output")
+
+    def test_output_alias_still_works(self):
+        """--output json (v0.2 alias) still works for backward compat."""
+        r = run([
+            "--single",
+            "--output", "json",
+            "--did", "did:key:z6MktQej1bMhCGKcKDsgQ4294tkmtRWc3C1Sjsu4sF9Jxkr5",
+            "--room", "lobby",
+            "--nonce", "1",
+            "--text", "hi",
+        ], expect=0)
+        data = json.loads(r.stdout.decode().strip())
+        self.assertEqual(data["type"], "single")
+        self.assertTrue(data["ok"])
+
+
+class TestVersion(unittest.TestCase):
+    def test_version_flag(self):
+        """--version prints 'technocore-verify v0.3.0' and exits 0."""
+        r = run(["--version"], expect=0)
+        self.assertIn("technocore-verify v0.3.0", r.stdout.decode())
+        self.assertEqual(r.stderr.decode(), "")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

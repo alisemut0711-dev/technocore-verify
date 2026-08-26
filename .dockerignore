@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environments
+venv/
+.env
+.venv/
+
+# Git
+.git/
+.gitignore
+
+# Tests
+tests/
+*.test.py
+.pytest_cache/
+
+# Documentation
+README.md
+LICENSE
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Misc
+.DS_Store
+Thumbs.db

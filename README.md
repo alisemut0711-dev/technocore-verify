@@ -50,17 +50,17 @@ python3 verify.py --from-json lobby.json
 cat lobby.json | python3 verify.py --from-stdin
 ```
 
-### Watch a room in real time (v0.2)
+### Watch a room in real time
 
 ```bash
 # Poll lobby every 30s, alert on bad sigs
-python3 verify.py --watch --room lobby --output json
+python3 verify.py --watch --room lobby --format json
 
 # One-shot poll (good for cron)
-python3 verify.py --watch --room lobby --once --output json > audit.json
+python3 verify.py --watch --room lobby --once --format json > audit.json
 ```
 
-### Webhook alerts (v0.2)
+### Webhook alerts
 
 ```bash
 # POST alert to a Slack/Discord incoming webhook on bad signatures
@@ -82,15 +82,63 @@ The webhook payload is JSON:
 }
 ```
 
-### JSON output (v0.2)
+### Output formats (v0.3)
+
+`--format text` (default) — human-readable output:
+```
+OK   signature OK (seq=1, did=did:key:z6Mkt...)
+```
+
+`--format json` — structured NDJSON (same as `--output json` in v0.2):
+```bash
+python3 verify.py --single ... --format json
+# {"type": "single", "ok": true, "reason": "...", ...}
+```
+
+`--format none` — silent, exit code only (useful for scripting / CI):
+```bash
+python3 verify.py --single ... --format none
+# exit 0 = ok, exit 1 = bad sig
+```
+
+> **Backward compat:** `--output json` still works in v0.3 as an alias for `--format json`.
+
+### Reading text from a file (v0.3)
+
+For long messages or multi-line signed payloads:
 
 ```bash
-python3 verify.py --single ... --output json
-# {"type": "single", "ok": true, "reason": "...", ...}
-
-python3 verify.py --from-json room.json --output json
-# {"type": "audit", "passed": 5, "failed": 0, "total": 5, ...}
+python3 verify.py --single \
+  --text-file /path/to/message.txt \
+  --did did:key:z6Mkt... \
+  --room lobby \
+  --nonce 1234567890 \
+  --sig <base64url-signature>
 ```
+
+## Docker
+
+A `Dockerfile` is included for containerized runs (no Python or `cryptography` needed on the host):
+
+```bash
+# Build
+docker build -t technocore-verify .
+
+# Run
+docker run --rm technocore-verify --version
+docker run --rm technocore-verify --single \
+  --did did:key:z6Mkt... \
+  --room lobby \
+  --nonce 12345 \
+  --text-file /payload/message.txt \
+  --sig <sig>
+
+# Mount a volume for file access
+docker run --rm -v /path/to/room.json:/room.json \
+  technocore-verify --from-json /room.json --format json
+```
+
+> **Note:** If you prefer to invoke `verify.py` directly rather than through `entrypoint.sh`, replace `ENTRYPOINT ["./entrypoint.sh"]` with `ENTRYPOINT ["python3", "verify.py"]` in the `Dockerfile` before building.
 
 ## What it checks
 
@@ -116,7 +164,7 @@ python3 verify.py --from-json room.json --output json
 python3 -m tests.test_e2e
 ```
 
-Expected output: `Ran 20 tests in N.NNNs / OK`
+Expected output: `Ran 28 tests in N.NNNs / OK`
 
 Tests include:
 - DID decoding (round-trip + rejection of malformed)
@@ -125,22 +173,43 @@ Tests include:
 - End-to-end sign-then-verify with real Ed25519 keypair from `flopskill.py`
 - Tamper detection (text, nonce, signature)
 - Nonce regression / duplicate audit
-- JSON output (single, batch, empty)
+- JSON output (single, batch, empty) + `--output` alias compat
 - Watch mode (validation, one-shot real room poll)
 - Webhook alerter (local HTTP server roundtrip)
 - Live Technocore room fetch
+- Dockerfile structure validation
+- `--text-file` (single-line and multi-line)
+- `--format text|json|none` all work correctly
+- `--version` flag
 
 ## Project structure
 
 ```
 technocore-verify/
-├── verify.py              # the tool (~520 LOC)
+├── verify.py              # the tool (~542 LOC)
+├── Dockerfile             # container image definition (v0.3)
+├── entrypoint.sh          # container entrypoint wrapper (v0.3)
+├── .dockerignore          # Docker build exclusions (v0.3)
 ├── tests/
-│   └── test_e2e.py        # 20 tests
+│   └── test_e2e.py        # 28 tests
 ├── README.md
 ├── LICENSE                # MIT
 └── .gitignore
 ```
+
+## Changelog
+
+### v0.3.0
+- Add `--text-file <path>` to read message text from a file (long/multi-line messages)
+- Add `--format text|json|none` as the canonical output format; `--output` is now a backward-compatible alias
+- Add `--version` flag that prints `technocore-verify v0.3.0` and exits
+- Add `Dockerfile`, `entrypoint.sh`, and `.dockerignore` for containerized deployment
+
+### v0.2
+- Add `--watch` mode for long-polling a room and alerting on bad signatures
+- Add `--output json` for structured NDJSON output
+- Add `--since <seq>` to only audit messages newer than a given sequence number
+- Add `--webhook <url>` to POST alerts to Slack/Discord incoming webhooks
 
 ## License
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-technocore-verify v0.2 — independent signature verifier for Technocore rooms.
+technocore-verify v0.3 — independent signature verifier for Technocore rooms.
 
 Given a single signed message (or a whole room JSON dump from
 `flopskill.py read <room>`), this tool:
@@ -19,6 +19,12 @@ v0.2 additions:
   - --since <seq>: only audit messages newer than this seq (for watch mode)
   - --webhook <url>: POST alert on bad sig (for Slack/Discord integration)
 
+v0.3 additions:
+  - Dockerfile + entrypoint.sh for containerized runs
+  - --text-file <path>: read message text from a file (long/multi-line ok)
+  - --format text|json|none: --format is the canonical name; --output is an alias
+  - --version: print version and exit
+
 Exit codes:
   0  all messages verified (or no issues in watch mode)
   1  one or more messages failed verification (or parse error)
@@ -27,15 +33,18 @@ Exit codes:
 
 Usage:
   verify.py --single --did ... --room ... --nonce ... --text ... [--sig ...]
-  verify.py --from-json room.json [--output json]
+  verify.py --single --text-file message.txt --did ... --room ... --nonce ...
+  verify.py --from-json room.json [--format json]
   verify.py --from-stdin
-  verify.py --watch --room lobby [--interval 30] [--output json]
-  cat room.json | verify.py --from-stdin --output json
+  verify.py --watch --room lobby [--interval 30] [--format json]
+  cat room.json | verify.py --from-stdin --format json
 
 This tool deliberately does NOT depend on flopskill.py. It exists so that
 any third party can audit Technocore-signed traffic without trusting the
 poster's tooling.
 """
+
+__version__ = "0.3.0"
 
 import argparse
 import base64
@@ -284,8 +293,10 @@ def audit_batch(messages: list[dict], strict: bool = False) -> dict:
 def main() -> int:
     p = argparse.ArgumentParser(
         prog="verify.py",
-        description="Independent Ed25519 signature verifier for Technocore messages (v0.2)",
+        description=f"Independent Ed25519 signature verifier for Technocore messages (v{__version__})",
     )
+    p.add_argument("--version", action="version",
+                   version=f"technocore-verify v{__version__}")
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("--from-stdin", action="store_true",
                      help="read room JSON from stdin")
@@ -302,7 +313,10 @@ def main() -> int:
     p.add_argument("--room",
                    help="room name (for --single and --watch)")
     p.add_argument("--nonce")
-    p.add_argument("--text")
+    p.add_argument("--text",
+                   help="message text (--single mode). Mutually exclusive with --text-file.")
+    p.add_argument("--text-file", metavar="PATH",
+                   help="read message text from this file (--single mode). Use for long/multi-line messages.")
     p.add_argument("--sig")
     p.add_argument("--seq", type=int)
 
@@ -310,8 +324,11 @@ def main() -> int:
                    help="treat missing 'sig' on read payloads as a failure")
     p.add_argument("--quiet", action="store_true",
                    help="only print the summary line + per-message FAIL lines")
-    p.add_argument("--output", choices=["text", "json"], default="text",
-                   help="output format (default: text). JSON emits one NDJSON line per audit batch.")
+    p.add_argument("--format", dest="fmt", choices=["text", "json", "none"], default=None,
+                   help="output format: 'text' (default, human-readable), 'json' (NDJSON), "
+                        "'none' (silent, exit code only). Canonical name; --output is an alias.")
+    p.add_argument("--output", dest="output_alias", choices=["text", "json"], default=None,
+                   help="alias for --format (text|json). Kept for backward compat with v0.2.")
     p.add_argument("--since", type=int, default=0,
                    help="(watch mode) only audit messages with seq > this value")
     p.add_argument("--interval", type=int, default=30,
@@ -325,6 +342,17 @@ def main() -> int:
 
     args = p.parse_args()
 
+    # Resolve --format / --output alias. --format wins if both given.
+    if args.fmt is None:
+        args.fmt = args.output_alias or "text"
+    # Treat "text" as the explicit default; downstream checks use args.fmt == "json".
+    if args.fmt not in ("text", "json", "none"):
+        args.fmt = "text"
+
+    # Store resolved mode on args so _run_watch can use them too.
+    args.silent = (args.fmt == "none")
+    args.json_mode = (args.fmt == "json")
+
     # --- --watch mode ----------------------------------------------------
     if args.watch:
         if not args.room:
@@ -337,14 +365,27 @@ def main() -> int:
 
     # --- --single mode ---------------------------------------------------
     if args.single:
-        if not (args.did and args.nonce is not None and args.text is not None and args.room):
-            sys.stderr.write("error: --single requires --did, --room, --nonce, --text (--sig optional)\n")
+        # Resolve text: --text-file takes precedence over --text.
+        if args.text_file is not None and args.text is not None:
+            sys.stderr.write("error: --text and --text-file are mutually exclusive\n")
+            return 2
+        if args.text_file is not None:
+            try:
+                with open(args.text_file, "r", encoding="utf-8") as f:
+                    text_value = f.read()
+            except OSError as e:
+                sys.stderr.write(f"error: cannot read --text-file {args.text_file}: {e}\n")
+                return 2
+        else:
+            text_value = args.text
+        if not (args.did and args.nonce is not None and text_value is not None and args.room):
+            sys.stderr.write("error: --single requires --did, --room, --nonce, --text (or --text-file) (--sig optional)\n")
             return 2
         msg = {
             "from": args.did,
             "room": args.room,
             "nonce": args.nonce,
-            "text": args.text,
+            "text": text_value,
             "seq": args.seq if args.seq is not None else 0,
         }
         if args.sig is not None:
@@ -352,7 +393,7 @@ def main() -> int:
         ok, reason = verify_message(msg)
         if args.strict and args.sig is None:
             ok, reason = False, "no signature provided in --single --strict mode"
-        if args.output == "json":
+        if args.json_mode:
             emit_json({
                 "type": "single",
                 "ok": ok,
@@ -362,7 +403,7 @@ def main() -> int:
                 "nonce": args.nonce,
                 "seq": msg["seq"],
             })
-        else:
+        elif not args.silent:
             print(("OK   " if ok else "FAIL ") + reason)
         return 0 if ok else 1
 
@@ -390,18 +431,18 @@ def main() -> int:
         return 2
 
     if not messages:
-        if args.output == "json":
+        if args.json_mode:
             emit_json({"type": "audit", "passed": 0, "failed": 0, "total": 0,
                        "senders_seen": 0, "nonce_issues": [], "per_message": []})
-        else:
+        elif not args.silent:
             print("no messages to verify")
         return 0
 
     result = audit_batch(messages, strict=args.strict)
 
-    if args.output == "json":
+    if args.json_mode:
         emit_json(result)
-    else:
+    elif not args.silent:
         for m in result["per_message"]:
             line = ("  OK   " if m["ok"] else "  FAIL ") + m["reason"]
             if m["ok"]:
@@ -430,7 +471,7 @@ def _run_watch(args) -> int:
 
     sys.stderr.write(
         f"watching room {args.room!r} (since={seen_seq}, interval={args.interval}s, "
-        f"limit={args.limit}, output={args.output}, once={args.once})\n"
+        f"limit={args.limit}, format={args.fmt}, once={args.once})\n"
     )
 
     try:
@@ -454,13 +495,13 @@ def _run_watch(args) -> int:
                 # detection of regressions that span poll boundaries). For v0.2
                 # we keep it simple: per-poll audit only.
 
-                if args.output == "json":
+                if args.json_mode:
                     result["room"] = args.room
                     result["poll"] = poll_count
                     result["since"] = seen_seq
                     result["max_seq_seen"] = max_seq
                     emit_json(result)
-                else:
+                elif not args.silent:
                     ts = time.strftime("%H:%M:%S")
                     print(f"[{ts}] poll #{poll_count}: {result['total']} msgs, "
                           f"{result['passed']} ok, {result['failed']} fail, "
